@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""KittenTTS daemon — loads model once, serves TTS over Unix socket.
+
+Not meant to be called directly. Use kitten-say, which auto-starts this.
+"""
+
+import argparse
+import json
+import os
+import signal
+import socket
+import struct
+import sys
+import threading
+import time
+
+# === Defaults ===
+SOCKET_PATH = "/tmp/kitten-tts.sock"
+MODEL_ID = "KittenML/kitten-tts-mini-0.8"
+DEFAULT_VOICE = "Jasper"
+SAMPLE_RATE = 24000
+
+
+class KittenBackend:
+    def __init__(self, model_id: str = MODEL_ID):
+        self._model_id = model_id
+        self._model = None
+
+    @property
+    def name(self) -> str:
+        return "kitten"
+
+    def load(self):
+        from kittentts import KittenTTS
+        self._model = KittenTTS(self._model_id)
+
+    def generate(self, text: str, voice: str = DEFAULT_VOICE):
+        """Returns (pcm_float32_numpy_array, sample_rate)."""
+        result = self._model.generate(text, voice=voice)
+        return result, SAMPLE_RATE
+
+    def voices(self) -> list:
+        return ["Bella", "Jasper", "Luna", "Bruno", "Rosie", "Hugo", "Kiki", "Leo"]
+
+
+class Daemon:
+    def __init__(self, socket_path: str, backend: KittenBackend, default_voice: str):
+        self.socket_path = socket_path
+        self.backend = backend
+        self.default_voice = default_voice
+        self._running = True
+        self._lock = threading.Lock()
+
+    def run(self):
+        if os.path.exists(self.socket_path):
+            os.unlink(self.socket_path)
+
+        self.backend.load()
+
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(self.socket_path)
+        srv.listen(4)
+        srv.settimeout(2.0)
+
+        # World-accessible so any local user can connect
+        os.chmod(self.socket_path, 0o777)
+
+        # Write PID file for client to find
+        pid_path = self.socket_path + ".pid"
+        try:
+            if os.path.exists(pid_path):
+                os.unlink(pid_path)
+        except OSError:
+            pass
+        with open(pid_path, "w") as f:
+            f.write(str(os.getpid()))
+        try:
+            os.chmod(pid_path, 0o666)
+        except OSError:
+            pass
+
+        print(f"[kitten-daemon] Ready (pid {os.getpid()})", flush=True)
+
+        signal.signal(signal.SIGTERM, lambda *_: self._shutdown())
+        signal.signal(signal.SIGINT, lambda *_: self._shutdown())
+
+        while self._running:
+            try:
+                conn, _ = srv.accept()
+                threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+        srv.close()
+        if os.path.exists(self.socket_path):
+            os.unlink(self.socket_path)
+        pid_path = self.socket_path + ".pid"
+        if os.path.exists(pid_path):
+            os.unlink(pid_path)
+
+    def _shutdown(self):
+        self._running = False
+
+    def _handle(self, conn: socket.socket):
+        try:
+            data = b""
+            while b"\n" not in data:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                data += chunk
+
+            req = json.loads(data.decode().strip())
+            cmd = req.get("cmd", "generate")
+
+            if cmd == "ping":
+                conn.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
+                return
+
+            if cmd == "voices":
+                conn.sendall(json.dumps({"voices": self.backend.voices()}).encode() + b"\n")
+                return
+
+            if cmd == "shutdown":
+                conn.sendall(json.dumps({"status": "shutting_down"}).encode() + b"\n")
+                self._shutdown()
+                return
+
+            # Generate TTS
+            text = req.get("text", "")
+            voice = req.get("voice", self.default_voice)
+            chunk_mode = req.get("chunk_mode", "sentence")
+
+            if not text:
+                conn.sendall(json.dumps({"error": "no text"}).encode() + b"\n")
+                return
+
+            chunks = self._split(text, chunk_mode)
+            header = {"status": "streaming", "chunks": len(chunks), "sample_rate": SAMPLE_RATE}
+            conn.sendall(json.dumps(header).encode() + b"\n")
+
+            for i, chunk_text in enumerate(chunks):
+                with self._lock:
+                    pcm, sr = self.backend.generate(chunk_text, voice=voice)
+
+                pcm_bytes = pcm.astype("float32").tobytes()
+                conn.sendall(struct.pack(">I", len(pcm_bytes)))
+                conn.sendall(pcm_bytes)
+
+            # End sentinel
+            conn.sendall(struct.pack(">I", 0))
+
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            try:
+                conn.sendall(json.dumps({"error": str(e)}).encode() + b"\n")
+            except Exception:
+                pass
+        finally:
+            conn.close()
+
+    def _split(self, text: str, mode: str) -> list:
+        if mode == "none":
+            return [text]
+        if mode == "paragraph":
+            paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+            return paras or [text]
+        if mode == "fixed":
+            size = 200
+            words = text.split()
+            chunks, current = [], []
+            length = 0
+            for w in words:
+                current.append(w)
+                length += len(w) + 1
+                if length >= size:
+                    chunks.append(" ".join(current))
+                    current, length = [], 0
+            if current:
+                chunks.append(" ".join(current))
+            return chunks or [text]
+        # Default: sentence
+        import re
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        return [s for s in sentences if s.strip()] or [text]
+
+
+def main():
+    p = argparse.ArgumentParser(description="KittenTTS daemon")
+    p.add_argument("-s", "--socket", default=SOCKET_PATH)
+    p.add_argument("-v", "--voice", default=DEFAULT_VOICE)
+    p.add_argument("-m", "--model", default=MODEL_ID)
+    args = p.parse_args()
+
+    backend = KittenBackend(args.model)
+    daemon = Daemon(args.socket, backend, args.voice)
+    daemon.run()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
