@@ -188,8 +188,6 @@ Other commands: `{"cmd": "ping"}`, `{"cmd": "voices"}`, `{"cmd": "shutdown"}`
 ## Credits
 
 - [KittenTTS](https://github.com/KittenML/kitten-tts) — the model doing the actual work
-- Built for use with [OpenClaw](https://github.com/openclaw/openclaw)
-
 ## License
 
 MIT
