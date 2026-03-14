@@ -4,17 +4,21 @@
 Usage:
   kitten-say "Hello world"              speak text
   kitten-say -v Luna "Hello world"      pick a voice
+  kitten-say -m nano "Hello world"      use nano model (fastest)
   kitten-say -o out.wav "Hello world"   save to file
   echo "Hello" | kitten-say             pipe from stdin
   kitten-say --voices                   list available voices
+  kitten-say --info                     show daemon model + status
   kitten-say --stop                     shut down daemon
 
+Models: nano (14M, fastest), micro (40M, balanced), mini (80M, best quality)
 Voices: Bella, Jasper, Luna, Bruno, Rosie, Hugo, Kiki, Leo
 """
 
 import argparse
 import json
 import os
+import signal
 import socket
 import struct
 import subprocess
@@ -25,6 +29,7 @@ import wave
 
 # === Defaults (tune these) ===
 DEFAULT_VOICE = "Jasper"
+DEFAULT_MODEL = "mini"
 DEFAULT_CHUNK_MODE = "sentence"     # sentence | paragraph | fixed | none
 DEFAULT_DELAY = 0.2                 # seconds of silence before playback (for BT/USB speaker wake)
 SOCKET_PATH = "/tmp/kitten-tts.sock"
@@ -34,7 +39,7 @@ PLAYER = "auto"                     # auto | afplay | play
 
 # Path to daemon script and venv python
 DAEMON_SCRIPT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "kitten-tts-daemon")
-VENV_PYTHON = "/Users/sanae/qwen-tts-env/bin/python3"
+VENV_PYTHON = None  # auto-detect; set to override (e.g. "/Users/marvin/tts-env-312/bin/python3")
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -42,10 +47,11 @@ def find_python():
     """Find the Python interpreter that has kittentts."""
     if VENV_PYTHON and os.path.exists(VENV_PYTHON):
         return VENV_PYTHON
-    # Try common locations
+    # Try common locations (prefer newer venvs first)
     candidates = [
-        os.path.expanduser("~/qwen-tts-env/bin/python3"),
+        os.path.expanduser("~/tts-env-312/bin/python3"),
         os.path.expanduser("~/tts-env/bin/python3"),
+        os.path.expanduser("~/qwen-tts-env/bin/python3"),
         "/usr/local/bin/python3",
         "python3",
     ]
@@ -73,7 +79,40 @@ def daemon_running(socket_path: str) -> bool:
         return False
 
 
-def start_daemon(socket_path: str) -> bool:
+def daemon_model(socket_path: str) -> str:
+    """Read the model the running daemon was started with."""
+    model_path = socket_path + ".model"
+    try:
+        with open(model_path) as f:
+            return f.read().strip()
+    except (OSError, FileNotFoundError):
+        return ""
+
+
+def stop_daemon(socket_path: str):
+    """Stop the running daemon gracefully."""
+    try:
+        sock = connect(socket_path, timeout=2.0)
+        sock.sendall(json.dumps({"cmd": "shutdown"}).encode() + b"\n")
+        sock.close()
+    except Exception:
+        pass
+    # Also try SIGTERM via PID file
+    pid_path = socket_path + ".pid"
+    try:
+        with open(pid_path) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGTERM)
+    except Exception:
+        pass
+    # Wait for socket to disappear
+    for _ in range(20):
+        if not os.path.exists(socket_path):
+            return
+        time.sleep(0.25)
+
+
+def start_daemon(socket_path: str, model: str = DEFAULT_MODEL) -> bool:
     """Launch daemon in background, wait until ready."""
     python = find_python()
     daemon = DAEMON_SCRIPT
@@ -82,12 +121,12 @@ def start_daemon(socket_path: str) -> bool:
         print(f"Error: daemon not found at {daemon}", file=sys.stderr)
         return False
 
-    print("Starting daemon (first-run model load may take a moment)...", file=sys.stderr)
+    print(f"Starting daemon (model: {model}, first-run model load may take a moment)...", file=sys.stderr)
 
     # Launch detached
     log = open("/tmp/kitten-tts-daemon.log", "a")
     subprocess.Popen(
-        [python, daemon, "-s", socket_path],
+        [python, daemon, "-s", socket_path, "-m", model],
         stdout=log, stderr=log,
         start_new_session=True,
     )
@@ -103,10 +142,29 @@ def start_daemon(socket_path: str) -> bool:
     return False
 
 
-def ensure_daemon(socket_path: str) -> bool:
+def resolve_model(name: str) -> str:
+    """Resolve friendly name to HF model ID (matches daemon's MODEL_MAP)."""
+    model_map = {
+        "nano":  "KittenML/kitten-tts-nano-0.8",
+        "micro": "KittenML/kitten-tts-micro-0.8",
+        "mini":  "KittenML/kitten-tts-mini-0.8",
+    }
+    return model_map.get(name.lower(), name)
+
+
+def ensure_daemon(socket_path: str, model: str = DEFAULT_MODEL) -> bool:
+    """Ensure daemon is running with the requested model. Restart if model changed."""
+    requested_id = resolve_model(model)
+
     if daemon_running(socket_path):
+        current = daemon_model(socket_path)
+        if current and current != requested_id:
+            print(f"Switching model: {current.split('/')[-1]} → {requested_id.split('/')[-1]}", file=sys.stderr)
+            stop_daemon(socket_path)
+            return start_daemon(socket_path, model)
         return True
-    return start_daemon(socket_path)
+
+    return start_daemon(socket_path, model)
 
 
 def recv_json(sock: socket.socket) -> dict:
@@ -182,8 +240,8 @@ def write_wav(path: str, pcm_bytes: bytes, sample_rate: int):
 
 # ── Commands ─────────────────────────────────────────────────────────────────
 
-def cmd_voices(socket_path: str):
-    if not ensure_daemon(socket_path):
+def cmd_voices(socket_path: str, model: str = DEFAULT_MODEL):
+    if not ensure_daemon(socket_path, model):
         return 1
     sock = connect(socket_path)
     sock.sendall(json.dumps({"cmd": "voices"}).encode() + b"\n")
@@ -194,23 +252,42 @@ def cmd_voices(socket_path: str):
     return 0
 
 
-def cmd_stop(socket_path: str):
+def cmd_info(socket_path: str):
     if not daemon_running(socket_path):
         print("Daemon not running.")
         return 0
     sock = connect(socket_path)
-    sock.sendall(json.dumps({"cmd": "shutdown"}).encode() + b"\n")
+    sock.sendall(json.dumps({"cmd": "info"}).encode() + b"\n")
+    resp = recv_json(sock)
     sock.close()
+    model = resp.get("model", "unknown")
+    # Show friendly name if possible
+    friendly = {v: k for k, v in {
+        "nano": "KittenML/kitten-tts-nano-0.8",
+        "micro": "KittenML/kitten-tts-micro-0.8",
+        "mini": "KittenML/kitten-tts-mini-0.8",
+    }.items()}.get(model, model)
+    print(f"  Model:  {friendly} ({model})")
+    print(f"  PID:    {resp.get('pid', '?')}")
+    print(f"  Voices: {', '.join(resp.get('voices', []))}")
+    return 0
+
+
+def cmd_stop(socket_path: str):
+    if not daemon_running(socket_path):
+        print("Daemon not running.")
+        return 0
+    stop_daemon(socket_path)
     print("Daemon stopped.")
     return 0
 
 
-def cmd_speak(text: str, voice: str, chunk_mode: str, output: str, socket_path: str, delay: float = 0.0):
+def cmd_speak(text: str, voice: str, chunk_mode: str, output: str, socket_path: str, delay: float = 0.0, model: str = DEFAULT_MODEL):
     if not text.strip():
         print("Nothing to say.", file=sys.stderr)
         return 1
 
-    if not ensure_daemon(socket_path):
+    if not ensure_daemon(socket_path, model):
         return 1
 
     sock = connect(socket_path, timeout=60.0)
@@ -284,11 +361,13 @@ def main():
     p = argparse.ArgumentParser(
         prog="kitten-say",
         description="Speak text using local KittenTTS.",
-        epilog="Voices: Bella, Jasper, Luna, Bruno, Rosie, Hugo, Kiki, Leo",
+        epilog="Models: nano (14M, fastest), micro (40M, balanced), mini (80M, best quality)\nVoices: Bella, Jasper, Luna, Bruno, Rosie, Hugo, Kiki, Leo",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("text", nargs="?", help="text to speak (or pipe via stdin)")
     p.add_argument("-v", "--voice", default=DEFAULT_VOICE, help=f"voice (default: {DEFAULT_VOICE})")
+    p.add_argument("-m", "--model", default=DEFAULT_MODEL,
+                   help=f"model: nano|micro|mini or full HF id (default: {DEFAULT_MODEL})")
     p.add_argument("-f", "--file", dest="infile", help="read text from file")
     p.add_argument("-d", "--delay", type=float, default=DEFAULT_DELAY,
                     help="seconds of silence before playback (e.g. 0.3 for BT speakers)")
@@ -298,12 +377,15 @@ def main():
     p.add_argument("-o", "--output", help="save to WAV file instead of playing")
     p.add_argument("-s", "--socket", default=SOCKET_PATH, help=argparse.SUPPRESS)
     p.add_argument("--voices", action="store_true", help="list available voices")
+    p.add_argument("--info", action="store_true", help="show daemon status and loaded model")
     p.add_argument("--stop", action="store_true", help="shut down the daemon")
 
     args = p.parse_args()
 
+    if args.info:
+        return cmd_info(args.socket)
     if args.voices:
-        return cmd_voices(args.socket)
+        return cmd_voices(args.socket, args.model)
     if args.stop:
         return cmd_stop(args.socket)
 
@@ -318,7 +400,7 @@ def main():
             return 0
         text = sys.stdin.read()
 
-    return cmd_speak(text, args.voice, args.chunks, args.output, args.socket, args.delay)
+    return cmd_speak(text, args.voice, args.chunks, args.output, args.socket, args.delay, args.model)
 
 
 if __name__ == "__main__":

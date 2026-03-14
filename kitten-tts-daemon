@@ -16,13 +16,25 @@ import time
 
 # === Defaults ===
 SOCKET_PATH = "/tmp/kitten-tts.sock"
-MODEL_ID = "KittenML/kitten-tts-mini-0.8"
 DEFAULT_VOICE = "Jasper"
 SAMPLE_RATE = 24000
 
+# Friendly model aliases → HuggingFace IDs
+MODEL_MAP = {
+    "nano":  "KittenML/kitten-tts-nano-0.8",
+    "micro": "KittenML/kitten-tts-micro-0.8",
+    "mini":  "KittenML/kitten-tts-mini-0.8",
+}
+DEFAULT_MODEL = "mini"
+
+
+def resolve_model(name: str) -> str:
+    """Resolve a friendly name or pass through a full HF model ID."""
+    return MODEL_MAP.get(name.lower(), name)
+
 
 class KittenBackend:
-    def __init__(self, model_id: str = MODEL_ID):
+    def __init__(self, model_id: str):
         self._model_id = model_id
         self._model = None
 
@@ -79,7 +91,16 @@ class Daemon:
         except OSError:
             pass
 
-        print(f"[kitten-daemon] Ready (pid {os.getpid()})", flush=True)
+        # Write model metadata so client can check which model is loaded
+        model_path = self.socket_path + ".model"
+        try:
+            with open(model_path, "w") as f:
+                f.write(self.backend._model_id)
+            os.chmod(model_path, 0o666)
+        except OSError:
+            pass
+
+        print(f"[kitten-daemon] Ready (pid {os.getpid()}, model {self.backend._model_id})", flush=True)
 
         signal.signal(signal.SIGTERM, lambda *_: self._shutdown())
         signal.signal(signal.SIGINT, lambda *_: self._shutdown())
@@ -99,6 +120,9 @@ class Daemon:
         pid_path = self.socket_path + ".pid"
         if os.path.exists(pid_path):
             os.unlink(pid_path)
+        model_path = self.socket_path + ".model"
+        if os.path.exists(model_path):
+            os.unlink(model_path)
 
     def _shutdown(self):
         self._running = False
@@ -121,6 +145,14 @@ class Daemon:
 
             if cmd == "voices":
                 conn.sendall(json.dumps({"voices": self.backend.voices()}).encode() + b"\n")
+                return
+
+            if cmd == "info":
+                conn.sendall(json.dumps({
+                    "model": self.backend._model_id,
+                    "voices": self.backend.voices(),
+                    "pid": os.getpid(),
+                }).encode() + b"\n")
                 return
 
             if cmd == "shutdown":
@@ -189,13 +221,18 @@ class Daemon:
 
 
 def main():
-    p = argparse.ArgumentParser(description="KittenTTS daemon")
+    p = argparse.ArgumentParser(
+        description="KittenTTS daemon",
+        epilog="Models: nano (14M), micro (40M), mini (80M, default)",
+    )
     p.add_argument("-s", "--socket", default=SOCKET_PATH)
     p.add_argument("-v", "--voice", default=DEFAULT_VOICE)
-    p.add_argument("-m", "--model", default=MODEL_ID)
+    p.add_argument("-m", "--model", default=DEFAULT_MODEL,
+                   help="model name (nano|micro|mini) or full HF id (default: mini)")
     args = p.parse_args()
 
-    backend = KittenBackend(args.model)
+    model_id = resolve_model(args.model)
+    backend = KittenBackend(model_id)
     daemon = Daemon(args.socket, backend, args.voice)
     daemon.run()
 
