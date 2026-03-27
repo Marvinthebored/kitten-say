@@ -5,11 +5,15 @@ Usage:
   kitten-say "Hello world"              speak text
   kitten-say -v Luna "Hello world"      pick a voice
   kitten-say -m nano "Hello world"      use nano model (fastest)
+  kitten-say -s "Hello world"           use native KittenTTS streaming
   kitten-say -o out.wav "Hello world"   save to file
   echo "Hello" | kitten-say             pipe from stdin
   kitten-say --voices                   list available voices
   kitten-say --info                     show daemon model + status
   kitten-say --stop                     shut down daemon
+
+Streaming: native KittenTTS streaming is enabled by default.
+           Use --no-stream to force kitten-say's own manual chunking path for A/B tests.
 
 Models: nano (14M, fastest), micro (40M, balanced), mini (80M, best quality)
 Voices: Bella, Jasper, Luna, Bruno, Rosie, Hugo, Kiki, Leo
@@ -32,6 +36,7 @@ DEFAULT_VOICE = "Jasper"
 DEFAULT_MODEL = "mini"
 DEFAULT_CHUNK_MODE = "sentence"     # sentence | paragraph | fixed | none
 DEFAULT_DELAY = 0.2                 # seconds of silence before playback (for BT/USB speaker wake)
+DEFAULT_STREAM = True               # use native KittenTTS streaming by default
 SOCKET_PATH = "/tmp/kitten-tts.sock"
 SAMPLE_RATE = 24000
 DAEMON_TIMEOUT = 90                 # max seconds to wait for daemon startup
@@ -123,8 +128,13 @@ def start_daemon(socket_path: str, model: str = DEFAULT_MODEL) -> bool:
 
     print(f"Starting daemon (model: {model}, first-run model load may take a moment)...", file=sys.stderr)
 
-    # Launch detached
-    log = open("/tmp/kitten-tts-daemon.log", "a")
+    # Launch detached — use world-writable log so any user can append
+    log_path = "/tmp/kitten-tts-daemon.log"
+    log = open(log_path, "a")
+    try:
+        os.chmod(log_path, 0o666)
+    except OSError:
+        pass
     subprocess.Popen(
         [python, daemon, "-s", socket_path, "-m", model],
         stdout=log, stderr=log,
@@ -267,9 +277,11 @@ def cmd_info(socket_path: str):
         "micro": "KittenML/kitten-tts-micro-0.8",
         "mini": "KittenML/kitten-tts-mini-0.8",
     }.items()}.get(model, model)
-    print(f"  Model:  {friendly} ({model})")
-    print(f"  PID:    {resp.get('pid', '?')}")
-    print(f"  Voices: {', '.join(resp.get('voices', []))}")
+    native = "yes" if resp.get("native_stream") else "no"
+    print(f"  Model:   {friendly} ({model})")
+    print(f"  PID:     {resp.get('pid', '?')}")
+    print(f"  Stream:  {native}")
+    print(f"  Voices:  {', '.join(resp.get('voices', []))}")
     return 0
 
 
@@ -282,7 +294,8 @@ def cmd_stop(socket_path: str):
     return 0
 
 
-def cmd_speak(text: str, voice: str, chunk_mode: str, output: str, socket_path: str, delay: float = 0.0, model: str = DEFAULT_MODEL):
+def cmd_speak(text: str, voice: str, chunk_mode: str, output: str, socket_path: str,
+              delay: float = 0.0, model: str = DEFAULT_MODEL, stream: bool = DEFAULT_STREAM):
     if not text.strip():
         print("Nothing to say.", file=sys.stderr)
         return 1
@@ -290,8 +303,10 @@ def cmd_speak(text: str, voice: str, chunk_mode: str, output: str, socket_path: 
     if not ensure_daemon(socket_path, model):
         return 1
 
-    sock = connect(socket_path, timeout=60.0)
-    req = {"text": text, "voice": voice, "chunk_mode": chunk_mode}
+    sock = connect(socket_path, timeout=120.0)
+    req = {"text": text, "voice": voice, "stream": stream}
+    if not stream:
+        req["chunk_mode"] = chunk_mode
     sock.sendall(json.dumps(req).encode() + b"\n")
 
     header = recv_json(sock)
@@ -301,6 +316,7 @@ def cmd_speak(text: str, voice: str, chunk_mode: str, output: str, socket_path: 
         return 1
 
     sample_rate = header.get("sample_rate", SAMPLE_RATE)
+    is_native = header.get("native_stream", False)
     all_pcm = b""
     chunk_idx = 0
     prev_player = None
@@ -344,13 +360,11 @@ def cmd_speak(text: str, voice: str, chunk_mode: str, output: str, socket_path: 
     if prev_player is not None:
         prev_player.wait()
 
-    # Clean up temp files (best effort)
-    # They're in /tmp, OS will clean eventually
-
     if output:
         write_wav(output, all_pcm, sample_rate)
         duration = len(all_pcm) / 4 / sample_rate
-        print(f"Saved {output} ({duration:.1f}s)")
+        mode = "native stream" if is_native else f"chunked ({chunk_mode})"
+        print(f"Saved {output} ({duration:.1f}s, {mode})")
 
     return 0
 
@@ -368,14 +382,18 @@ def main():
     p.add_argument("-v", "--voice", default=DEFAULT_VOICE, help=f"voice (default: {DEFAULT_VOICE})")
     p.add_argument("-m", "--model", default=DEFAULT_MODEL,
                    help=f"model: nano|micro|mini or full HF id (default: {DEFAULT_MODEL})")
+    p.add_argument("-s", "--stream", action="store_true", default=DEFAULT_STREAM,
+                   help="use KittenTTS native streaming (default: on)")
+    p.add_argument("--no-stream", action="store_true",
+                   help="disable native streaming, use manual chunking")
     p.add_argument("-f", "--file", dest="infile", help="read text from file")
     p.add_argument("-d", "--delay", type=float, default=DEFAULT_DELAY,
                     help="seconds of silence before playback (e.g. 0.3 for BT speakers)")
     p.add_argument("-c", "--chunks", default=DEFAULT_CHUNK_MODE,
                     choices=["sentence", "paragraph", "fixed", "none"],
-                    help=f"chunking mode (default: {DEFAULT_CHUNK_MODE})")
+                    help=f"chunking mode when not streaming (default: {DEFAULT_CHUNK_MODE})")
     p.add_argument("-o", "--output", help="save to WAV file instead of playing")
-    p.add_argument("-s", "--socket", default=SOCKET_PATH, help=argparse.SUPPRESS)
+    p.add_argument("--socket", default=SOCKET_PATH, help=argparse.SUPPRESS)
     p.add_argument("--voices", action="store_true", help="list available voices")
     p.add_argument("--info", action="store_true", help="show daemon status and loaded model")
     p.add_argument("--stop", action="store_true", help="shut down the daemon")
@@ -400,7 +418,10 @@ def main():
             return 0
         text = sys.stdin.read()
 
-    return cmd_speak(text, args.voice, args.chunks, args.output, args.socket, args.delay, args.model)
+    # Resolve stream flag: --no-stream overrides -s
+    use_stream = args.stream and not args.no_stream
+
+    return cmd_speak(text, args.voice, args.chunks, args.output, args.socket, args.delay, args.model, use_stream)
 
 
 if __name__ == "__main__":

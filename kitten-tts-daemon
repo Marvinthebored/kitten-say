@@ -37,6 +37,7 @@ class KittenBackend:
     def __init__(self, model_id: str):
         self._model_id = model_id
         self._model = None
+        self._has_stream = False
 
     @property
     def name(self) -> str:
@@ -45,11 +46,21 @@ class KittenBackend:
     def load(self):
         from kittentts import KittenTTS
         self._model = KittenTTS(self._model_id)
+        self._has_stream = hasattr(self._model, "generate_stream")
+
+    @property
+    def can_stream(self) -> bool:
+        return self._has_stream
 
     def generate(self, text: str, voice: str = DEFAULT_VOICE):
         """Returns (pcm_float32_numpy_array, sample_rate)."""
         result = self._model.generate(text, voice=voice)
         return result, SAMPLE_RATE
+
+    def generate_stream(self, text: str, voice: str = DEFAULT_VOICE):
+        """Yields (pcm_float32_numpy_array, sample_rate) per chunk."""
+        for chunk_audio in self._model.generate_stream(text, voice=voice):
+            yield chunk_audio, SAMPLE_RATE
 
     def voices(self) -> list:
         return ["Bella", "Jasper", "Luna", "Bruno", "Rosie", "Hugo", "Kiki", "Leo"]
@@ -100,7 +111,8 @@ class Daemon:
         except OSError:
             pass
 
-        print(f"[kitten-daemon] Ready (pid {os.getpid()}, model {self.backend._model_id})", flush=True)
+        stream_status = "yes" if self.backend.can_stream else "no"
+        print(f"[kitten-daemon] Ready (pid {os.getpid()}, model {self.backend._model_id}, native_stream={stream_status})", flush=True)
 
         signal.signal(signal.SIGTERM, lambda *_: self._shutdown())
         signal.signal(signal.SIGINT, lambda *_: self._shutdown())
@@ -152,6 +164,7 @@ class Daemon:
                     "model": self.backend._model_id,
                     "voices": self.backend.voices(),
                     "pid": os.getpid(),
+                    "native_stream": self.backend.can_stream,
                 }).encode() + b"\n")
                 return
 
@@ -164,13 +177,30 @@ class Daemon:
             text = req.get("text", "")
             voice = req.get("voice", self.default_voice)
             chunk_mode = req.get("chunk_mode", "sentence")
+            use_stream = req.get("stream", False)
 
             if not text:
                 conn.sendall(json.dumps({"error": "no text"}).encode() + b"\n")
                 return
 
+            # Native streaming: let KittenTTS handle chunking internally
+            if use_stream and self.backend.can_stream:
+                header = {"status": "streaming", "chunks": -1, "sample_rate": SAMPLE_RATE, "native_stream": True}
+                conn.sendall(json.dumps(header).encode() + b"\n")
+
+                with self._lock:
+                    for pcm, sr in self.backend.generate_stream(text, voice=voice):
+                        pcm_bytes = pcm.astype("float32").tobytes()
+                        conn.sendall(struct.pack(">I", len(pcm_bytes)))
+                        conn.sendall(pcm_bytes)
+
+                # End sentinel
+                conn.sendall(struct.pack(">I", 0))
+                return
+
+            # Fallback: manual chunking + batch generate
             chunks = self._split(text, chunk_mode)
-            header = {"status": "streaming", "chunks": len(chunks), "sample_rate": SAMPLE_RATE}
+            header = {"status": "streaming", "chunks": len(chunks), "sample_rate": SAMPLE_RATE, "native_stream": False}
             conn.sendall(json.dumps(header).encode() + b"\n")
 
             for i, chunk_text in enumerate(chunks):
